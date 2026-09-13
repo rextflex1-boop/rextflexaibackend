@@ -1,9 +1,9 @@
 {
-  "name": "rextflex-ai-backend",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {"start": "node src/server.js"},
-  "dependencies": {"cors": "^2.8.5", "dotenv": "^17.2.2", "express": "^5.1.0"},
-  "engines": {"node": ">=20"}
+  "name":"rextflex-ai-backend",
+  "version":"2.0.0",
+  "private":true,
+  "type":"module",
+  "scripts":{"start":"node src/server.js"},
+  "dependencies":{"bcryptjs":"^3.0.2","cors":"^2.8.5","dotenv":"^16.6.1","e2b":"^2.46.1","express":"^5.1.0","groq-sdk":"^0.31.0","pg":"^8.16.3"},
+  "engines":{"node":"20.x"}
 }

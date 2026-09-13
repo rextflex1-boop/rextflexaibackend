@@ -1,69 +1,83 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import crypto from 'node:crypto';
+import bcrypt from 'bcryptjs';
+import pg from 'pg';
+import Groq from 'groq-sdk';
+import { Sandbox } from 'e2b';
+import fs from 'node:fs/promises';
 
+const { Pool } = pg;
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
-app.use(express.json({ limit: '8mb' }));
-
-const models = {
+const PORT = Number(process.env.PORT || 8080);
+const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes('neon.tech') ? { rejectUnauthorized: false } : undefined }) : null;
+const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY, defaultHeaders: { 'Groq-Model-Version': 'latest' } }) : null;
+const MAX_ZIP_BYTES = Math.max(1, Number(process.env.E2B_MAX_ZIP_MB || 8)) * 1024 * 1024;
+const SESSION_DAYS = Number(process.env.SESSION_DAYS || 30);
+const MODEL = {
   silicon: process.env.GROQ_MODEL_SILICON || 'openai/gpt-oss-20b',
   titan: process.env.GROQ_MODEL_TITAN || 'openai/gpt-oss-120b',
   apex: process.env.GROQ_MODEL_APEX || 'qwen/qwen3.8-27b',
 };
+const WEB_MODEL = process.env.GROQ_WEB_MODEL || 'groq/compound-mini';
+const VISION_MODEL = process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b';
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'rextflex-ai-backend' }));
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*', credentials: false }));
+app.use(express.json({ limit: process.env.JSON_LIMIT || '12mb' }));
+app.get('/', (_req,res)=>res.json({ok:true,name:'RextFlex AI backend',database:Boolean(pool),groq:Boolean(groq),e2b:Boolean(process.env.E2B_API_KEY)}));
+app.get('/health', (_req,res)=>res.json({ok:true,database:Boolean(pool),groq:Boolean(groq),e2b:Boolean(process.env.E2B_API_KEY)}));
 
-function normalizeMessages(items) {
-  return (Array.isArray(items) ? items : []).slice(-40).map((m) => {
-    const out = { role: m.role === 'assistant' ? 'assistant' : 'user', content: m.text || '' };
-    // Optional image attachment. If the client later sends a data URI, pass it as a multimodal user message.
-    if (m.role === 'user' && m.imageUri && /^data:image\//.test(m.imageUri)) {
-      out.content = [
-        { type: 'text', text: m.text || 'Please analyze the attached image.' },
-        { type: 'image_url', image_url: { url: m.imageUri } },
-      ];
-    }
-    return out;
-  });
-}
+const q = async (text, params=[]) => { if(!pool) throw new Error('DATABASE_URL is not configured.'); return pool.query(text,params); };
+const id = (prefix='id') => `${prefix}_${crypto.randomBytes(10).toString('hex')}`;
+const token = () => crypto.randomBytes(40).toString('base64url');
+const hash = (v) => crypto.createHash('sha256').update(v).digest('hex');
+const fileSig = (fileId,userId) => crypto.createHmac('sha256',process.env.BETTER_AUTH_SECRET||'rextflex-dev-secret').update(`${fileId}:${userId}`).digest('base64url');
+const safeEqualText = (a,b) => { const A=Buffer.from(String(a)); const B=Buffer.from(String(b)); return A.length===B.length && crypto.timingSafeEqual(A,B); };
 
-app.post('/api/chat', async (req, res) => {
-  try {
-    if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: 'GROQ_API_KEY is not configured on the backend.' });
-    const { messages, modelTier = 'titan', thinkingEnabled = true, webSearchEnabled = true } = req.body || {};
-    const model = models[modelTier] || models.titan;
-    const system = [
-      'You are RextFlex AI, a helpful mobile AI assistant.',
-      'Answer clearly and directly. Match the user\'s language and tone.',
-      thinkingEnabled ? 'Use extra reasoning internally when the model supports it. Do not reveal private chain-of-thought.' : 'Prefer concise direct answers.',
-      webSearchEnabled ? 'You may use current knowledge available to you, but do not invent live web results.' : 'Do not claim to have browsed the web.',
-    ].join(' ');
+function getBearer(req){ const h=req.headers.authorization||''; return h.startsWith('Bearer ')?h.slice(7):null; }
+async function auth(req,res,next){ try{ const raw=getBearer(req); if(!raw) return res.status(401).json({error:'Unauthorized'}); const r=await q(`select u.id,u.name,u.email,u.image,s.expires_at from auth_sessions s join app_users u on u.id=s.user_id where s.token_hash=$1 and s.expires_at>now()`,[hash(raw)]); if(!r.rows[0]) return res.status(401).json({error:'Session expired'}); req.user=r.rows[0];req.rawToken=raw;next(); }catch(e){console.error(e);res.status(500).json({error:'Authentication service unavailable'});} }
 
-    const body = {
-      model,
-      messages: [{ role: 'system', content: system }, ...normalizeMessages(messages)],
-      temperature: 0.6,
-      max_tokens: Number(process.env.MAX_OUTPUT_TOKENS || 2048),
-    };
+async function createSession(userId){ const raw=token(); await q(`insert into auth_sessions(id,user_id,token_hash,expires_at) values($1,$2,$3,now()+($4||' days')::interval)`,[id('sess'),userId,hash(raw),SESSION_DAYS]); return raw; }
+async function findUserByEmail(email){const r=await q(`select id,name,email,image,password_hash from app_users where lower(email)=lower($1)`,[email]);return r.rows[0];}
+async function ensureSessionOwned(sessionId,userId){const r=await q(`select id,title,updated_at,is_public from chat_sessions where id=$1 and user_id=$2`,[sessionId,userId]);return r.rows[0];}
 
-    const upstream = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const raw = await upstream.text();
-    let data = null; try { data = JSON.parse(raw); } catch {}
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({ error: data?.error?.message || raw || 'Upstream AI request failed.' });
-    }
-    const text = data?.choices?.[0]?.message?.content || '';
-    return res.json({ text, model });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Backend error while contacting the AI provider.' });
-  }
-});
+app.post('/api/auth/register',async(req,res)=>{try{const {name,email,password}=req.body||{};if(!name||!email||!password||String(password).length<6)return res.status(400).json({error:'Name, valid email and password of 6+ characters are required.'});if(await findUserByEmail(email))return res.status(409).json({error:'An account with this email already exists.'});const uid=id('usr');const pw=await bcrypt.hash(password,12);await q(`insert into app_users(id,name,email,password_hash) values($1,$2,$3,$4)`,[uid,String(name).trim().slice(0,80),String(email).trim().toLowerCase(),pw]);const tok=await createSession(uid);return res.json({token:tok,user:{id:uid,name:String(name).trim().slice(0,80),email:String(email).trim().toLowerCase(),image:null}})}catch(e){console.error(e);res.status(500).json({error:'Could not create account.'})}});
+app.post('/api/auth/login',async(req,res)=>{try{const {email,password}=req.body||{};const u=await findUserByEmail(email||'');if(!u||!(await bcrypt.compare(password||'',u.password_hash)))return res.status(401).json({error:'Invalid email or password.'});const tok=await createSession(u.id);res.json({token:tok,user:{id:u.id,name:u.name,email:u.email,image:u.image||null}})}catch(e){console.error(e);res.status(500).json({error:'Could not sign in.'})}});
+app.get('/api/auth/me',auth,async(req,res)=>res.json({user:{id:req.user.id,name:req.user.name,email:req.user.email,image:req.user.image||null}}));
+app.post('/api/auth/logout',auth,async(req,res)=>{await q(`delete from auth_sessions where token_hash=$1`,[hash(req.rawToken)]);res.json({ok:true})});
 
-const port = Number(process.env.PORT || 8080);
-app.listen(port, () => console.log(`RextFlex backend listening on ${port}`));
+// Optional Google OAuth handoff for the mobile app.
+function signState(payload){ const body=Buffer.from(JSON.stringify(payload)).toString('base64url'); const sig=crypto.createHmac('sha256',process.env.BETTER_AUTH_SECRET||'rextflex-dev-secret').update(body).digest('base64url'); return `${body}.${sig}`; }
+function verifyState(value){ const [body,sig]=String(value||'').split('.'); if(!body||!sig)return null; const exp=crypto.createHmac('sha256',process.env.BETTER_AUTH_SECRET||'rextflex-dev-secret').update(body).digest('base64url');if(!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(exp)))return null;const data=JSON.parse(Buffer.from(body,'base64url').toString('utf8'));if(Date.now()-data.ts>10*60*1000)return null;return data; }
+app.get('/api/auth/google/start',(req,res)=>{if(!process.env.GOOGLE_CLIENT_ID||!process.env.GOOGLE_REDIRECT_URI)return res.status(501).json({error:'Google OAuth is not configured on the backend.'});const redirect=String(req.query.redirect_uri||'rextflexai://auth');const state=signState({redirect,ts:Date.now()});const u=new URL('https://accounts.google.com/o/oauth2/v2/auth');u.searchParams.set('client_id',process.env.GOOGLE_CLIENT_ID);u.searchParams.set('redirect_uri',process.env.GOOGLE_REDIRECT_URI);u.searchParams.set('response_type','code');u.searchParams.set('scope','openid email profile');u.searchParams.set('access_type','offline');u.searchParams.set('state',state);res.redirect(u.toString())});
+app.get('/api/auth/google/callback',async(req,res)=>{try{const state=verifyState(req.query.state);if(!state)return res.status(400).send('Invalid OAuth state.');const code=String(req.query.code||'');const tokenRes=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({code,client_id:process.env.GOOGLE_CLIENT_ID,client_secret:process.env.GOOGLE_CLIENT_SECRET,redirect_uri:process.env.GOOGLE_REDIRECT_URI,grant_type:'authorization_code'})});const td=await tokenRes.json();if(!tokenRes.ok)throw new Error(td.error_description||'Google token exchange failed');const infoRes=await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:`Bearer ${td.access_token}`}});const info=await infoRes.json();if(!infoRes.ok)throw new Error('Could not read Google profile');let u=await findUserByEmail(info.email);if(!u){const uid=id('usr');const pw=await bcrypt.hash(crypto.randomBytes(32).toString('hex'),12);await q(`insert into app_users(id,name,email,password_hash,image) values($1,$2,$3,$4,$5)`,[uid,info.name||'RextFlex User',info.email.toLowerCase(),pw,info.picture||null]);u={id:uid,name:info.name||'RextFlex User',email:info.email.toLowerCase(),image:info.picture||null};}const appToken=await createSession(u.id);const target=new URL(state.redirect);target.searchParams.set('token',appToken);target.searchParams.set('name',u.name);target.searchParams.set('email',u.email); target.searchParams.set('id',u.id);res.redirect(target.toString())}catch(e){console.error(e);res.status(500).send(`Google sign-in failed: ${e.message}`)}});
+
+app.post('/api/sessions',auth,async(req,res)=>{const sid=id('chat');await q(`insert into chat_sessions(id,user_id,title) values($1,$2,$3)`,[sid,req.user.id,'New chat']);const r=await ensureSessionOwned(sid,req.user.id);res.json({session:{id:r.id,title:r.title,updatedAt:r.updated_at}})});
+app.get('/api/sessions',auth,async(req,res)=>{const r=await q(`select id,title,updated_at from chat_sessions where user_id=$1 order by updated_at desc limit 100`,[req.user.id]);res.json({sessions:r.rows.map(x=>({id:x.id,title:x.title,updatedAt:x.updated_at}))})});
+app.get('/api/sessions/:id',auth,async(req,res)=>{const session=await ensureSessionOwned(req.params.id,req.user.id);if(!session)return res.status(404).json({error:'Session not found.'});const r=await q(`select message from chat_messages where session_id=$1 order by created_at asc,id asc`,[req.params.id]);res.json({session:{id:session.id,title:session.title,updatedAt:session.updated_at},messages:r.rows.map(x=>x.message)})});
+app.patch('/api/sessions/:id',auth,async(req,res)=>{const session=await ensureSessionOwned(req.params.id,req.user.id);if(!session)return res.status(404).json({error:'Session not found.'});await q(`update chat_sessions set title=$1,updated_at=now() where id=$2 and user_id=$3`,[String(req.body.title||'New chat').trim().slice(0,80),req.params.id,req.user.id]);res.json({ok:true})});
+app.delete('/api/sessions/:id',auth,async(req,res)=>{await q(`delete from chat_sessions where id=$1 and user_id=$2`,[req.params.id,req.user.id]);res.json({ok:true})});
+
+app.post('/api/sessions/:id/share',auth,async(req,res)=>{const session=await ensureSessionOwned(req.params.id,req.user.id);if(!session)return res.status(404).json({error:'Session not found.'});await q(`update chat_sessions set is_public=true where id=$1 and user_id=$2`,[req.params.id,req.user.id]);const base=process.env.PUBLIC_URL||'';res.json({url:`${base}/share/${req.params.id}`})});
+app.get('/share/:id',async(req,res)=>{const sr=await q(`select title from chat_sessions where id=$1 and is_public=true`,[req.params.id]);if(!sr.rows[0])return res.status(404).send('Shared chat not found.');const mr=await q(`select message from chat_messages where session_id=$1 order by created_at asc,id asc`,[req.params.id]);const safe=(x)=>String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');const html=mr.rows.map(x=>{const m=x.message||{};return `<article class="${m.role==='user'?'user':'ai'}"><div class="meta">${m.role==='user'?'You':'RextFlex AI'}</div><div>${safe(m.text||'')}</div></article>`}).join('');res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>${safe(sr.rows[0].title||'RextFlex AI shared chat')}</title><style>body{font-family:system-ui;background:#080b11;color:#f5f7fb;max-width:760px;margin:0 auto;padding:24px}.ai,.user{padding:14px 16px;border-radius:16px;margin:10px 0;white-space:pre-wrap}.ai{background:#111722;border:1px solid #283245}.user{background:#38d6f4;color:#061014}.meta{font-size:11px;font-weight:800;opacity:.7;margin-bottom:7px}</style></head><body><h1>RextFlex AI</h1>${html}</body></html>`)});
+app.get('/api/settings',auth,async(req,res)=>{const sr=await q(`select tone,active_persona_id,model_tier from user_settings where user_id=$1`,[req.user.id]);const pr=await q(`select id,name,instructions from personas where user_id=$1 order by created_at asc`,[req.user.id]);const x=sr.rows[0]||{};res.json({tone:x.tone||'',activePersonaId:x.active_persona_id||null,modelTier:x.model_tier||'titan',personas:pr.rows})});
+app.put('/api/settings',auth,async(req,res)=>{const tone=typeof req.body.tone==='string'?req.body.tone:'';const modelTier=['silicon','titan','apex'].includes(req.body.modelTier)?req.body.modelTier:'titan';const activePersonaId=req.body.activePersonaId||null;await q(`insert into user_settings(user_id,tone,active_persona_id,model_tier) values($1,$2,$3,$4) on conflict(user_id) do update set tone=coalesce($2,user_settings.tone),active_persona_id=coalesce($3,user_settings.active_persona_id),model_tier=$4,updated_at=now()`,[req.user.id,tone,activePersonaId,modelTier]);res.json({ok:true})});
+app.post('/api/personas',auth,async(req,res)=>{const pid=id('persona');await q(`insert into personas(id,user_id,name,instructions) values($1,$2,$3,$4)`,[pid,req.user.id,String(req.body.name||'Persona').trim().slice(0,60),String(req.body.instructions||'').trim()]);res.json({id:pid})});
+app.delete('/api/personas/:id',auth,async(req,res)=>{await q(`delete from personas where id=$1 and user_id=$2`,[req.params.id,req.user.id]);res.json({ok:true})});
+
+function modelFor(tier){return MODEL[tier]||MODEL.titan;}
+function buildGroqMessages(messages,system){const arr=[];if(system)arr.push({role:'system',content:system});for(const m of messages.slice(-30)){const content=[];if(m.text)content.push({type:'text',text:String(m.text).slice(0,12000)});if(m.imageUri){content.push({type:'image_url',image_url:{url:m.imageUri}})}arr.push({role:m.role,content:content.length===1&&content[0].type==='text'?content[0].text:content});}return arr;}
+async function getPrompt(userId){const r=await q(`select s.tone,p.instructions from user_settings s left join personas p on p.id=s.active_persona_id where s.user_id=$1`,[userId]);if(!r.rows[0])return '';return r.rows[0].instructions||r.rows[0].tone||'';}
+
+app.post('/api/chat',auth,async(req,res)=>{try{if(!groq)return res.status(503).json({error:'GROQ_API_KEY is not configured.'});const {messages=[],sessionId,modelTier='titan',thinkingEnabled=true,webSearchEnabled=true}=req.body||{};if(!sessionId||!(await ensureSessionOwned(sessionId,req.user.id)))return res.status(404).json({error:'Chat session not found.'});const userMessage=messages[messages.length-1];if(userMessage?.role==='user'){await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'user',$3::jsonb) on conflict do nothing`,[userMessage.id||id('msg'),sessionId,JSON.stringify(userMessage)]);await q(`update chat_sessions set title=coalesce(title, $1),updated_at=now() where id=$2 and user_id=$3`,[String(userMessage.text||'New chat').trim().slice(0,80),sessionId,req.user.id]);}
+  const extra=await getPrompt(req.user.id);const system=`You are RextFlex AI, a helpful high-quality general AI assistant. Be accurate, practical, concise but useful. ${extra||''}`.trim();const hasImage=messages.some(m=>Boolean(m?.imageUri));const model=(webSearchEnabled&&!hasImage)?WEB_MODEL:(hasImage?VISION_MODEL:modelFor(modelTier));const body={model,messages:buildGroqMessages(messages,system),max_completion_tokens:4096,temperature:0.4};if(webSearchEnabled&&!hasImage)body.compound_custom={tools:{enabled_tools:['web_search','visit_website']}};if(thinkingEnabled&&!webSearchEnabled)body.reasoning_effort=(modelTier==='silicon'?'low':modelTier==='apex'?'medium':'medium');const r=await groq.chat.completions.create(body);const text=r.choices?.[0]?.message?.content||'No response was returned.';const assistant={id:id('msg'),role:'assistant',text,createdAt:Date.now()};await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'assistant',$3::jsonb)`,[assistant.id,sessionId,JSON.stringify(assistant)]);await q(`update chat_sessions set updated_at=now() where id=$1`,[sessionId]);const citations=(r.choices?.[0]?.message?.executed_tools||[]).flatMap(x=>x.search_results||[]).map(x=>({title:x.title||x.url||'Source',url:x.url||''})).filter(x=>x.url).slice(0,10);res.json({message:assistant,sessionId,citations});}catch(e){console.error('chat',e);res.status(500).json({error:e?.message||'AI request failed.'})}});
+
+const FILE_SYSTEM=`You are an expert software engineer. Generate a complete small project from the user's request. Return ONLY valid JSON with shape {"reply":"string","files":[{"path":"relative/path","content":"text"}],"setupCommands":["optional shell command"]}. Keep files concise and omit dependencies' lockfiles/node_modules. The project must be directly usable. Prefer simple static HTML/CSS/JS when the user does not specify a framework.`;
+app.post('/api/build',auth,async(req,res)=>{try{if(!groq)return res.status(503).json({error:'GROQ_API_KEY is not configured.'});if(!process.env.E2B_API_KEY)return res.status(503).json({error:'E2B_API_KEY is not configured.'});const prompt=String(req.body?.prompt||'').trim();if(!prompt)return res.status(400).json({error:'Build prompt is required.'});const model=modelFor(req.body?.modelTier||'titan');const out=await groq.chat.completions.create({model,messages:[{role:'system',content:FILE_SYSTEM},{role:'user',content:prompt}],response_format:{type:'json_object'},max_completion_tokens:16000,temperature:0.2});let spec;try{spec=JSON.parse(out.choices?.[0]?.message?.content||'{}')}catch{throw new Error('AI returned invalid project JSON. Try a more specific build prompt.')}if(!Array.isArray(spec.files)||spec.files.length===0)throw new Error('AI did not return any project files.');const sandbox=await Sandbox.create({timeoutMs:10*60*1000});const root='/home/user/project';const logs=[];for(const f of spec.files.slice(0,40)){const p=`${root}/${String(f.path||'').replace(/^\/+|\.\.(\/|\\)/g,'')}`;await sandbox.files.write([{path:p,data:String(f.content??'')}]);logs.push(`Wrote ${f.path}`)}for(const cmd of (Array.isArray(spec.setupCommands)?spec.setupCommands:[]).slice(0,6)){const result=await sandbox.commands.run(`cd ${root} && ${cmd}`,{timeoutMs:90000});logs.push(`$ ${cmd}\n${result.stdout||result.stderr||''}`)}await sandbox.files.write([{path:'/home/user/_zip.py',data:`import os,zipfile\nsrc='${root}'\ndst='/home/user/project.zip'\nwith zipfile.ZipFile(dst,'w',zipfile.ZIP_DEFLATED) as z:\n  for r,ds,fs in os.walk(src):\n    ds[:]=[d for d in ds if d not in ('node_modules','.git')]\n    for fn in fs:\n      p=os.path.join(r,fn); z.write(p,os.path.relpath(p,src))\n`}]);const z=await sandbox.commands.run('python3 /home/user/_zip.py',{timeoutMs:90000});if(z.exitCode!==0)throw new Error('ZIP creation failed.');const info=await sandbox.files.getInfo('/home/user/project.zip');if(!info||info.size>MAX_ZIP_BYTES)throw new Error(`Project ZIP is too large (${((info?.size||0)/1024/1024).toFixed(1)}MB).`);const bytes=await sandbox.files.read('/home/user/project.zip',{format:'bytes'});const fileId=id('file');const fileName=(String(spec.zipName||'rextflex-project.zip').replace(/[^a-zA-Z0-9._-]/g,'-').slice(0,80)||'rextflex-project.zip');await q(`insert into generated_files(id,user_id,session_id,file_name,mime_type,size_bytes,data) values($1,$2,$3,$4,'application/zip',$5,$6)`,[fileId,req.user.id,req.body.sessionId||null,fileName,bytes.length,Buffer.from(bytes)]);if(req.body.sessionId){const msg={id:id('msg'),role:'assistant',text:String(spec.reply||`Built ${fileName}`),file:{id:fileId,name:fileName,url:`${process.env.PUBLIC_URL||''}/api/files/${fileId}?sig=${fileSig(fileId,req.user.id)}`,sizeBytes:bytes.length},createdAt:Date.now()};await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'assistant',$3::jsonb)`,[msg.id,req.body.sessionId,JSON.stringify(msg)])}await sandbox.kill();res.json({reply:String(spec.reply||`Built ${fileName} successfully.`),file:{id:fileId,name:fileName,url:`${process.env.PUBLIC_URL||''}/api/files/${fileId}?sig=${fileSig(fileId,req.user.id)}`,sizeBytes:bytes.length},log:logs.join('\n')});}catch(e){console.error('build',e);res.status(500).json({error:e?.message||'Build failed.'})}});
+
+app.get('/api/files/:id',async(req,res)=>{let userId=null;const raw=getBearer(req);if(raw){const r=await q(`select user_id from auth_sessions where token_hash=$1 and expires_at>now()`,[hash(raw)]);userId=r.rows[0]?.user_id||null;}if(!userId&&req.query.sig){const r=await q(`select user_id from generated_files where id=$1`,[req.params.id]);const uid=r.rows[0]?.user_id;if(uid&&safeEqualText(String(req.query.sig),fileSig(req.params.id,uid)))userId=uid;}if(!userId)return res.status(401).json({error:'Unauthorized file link.'});const r=await q(`select file_name,mime_type,size_bytes,data from generated_files where id=$1 and user_id=$2`,[req.params.id,userId]);const x=r.rows[0];if(!x)return res.status(404).json({error:'File not found.'});res.setHeader('Content-Type',x.mime_type);res.setHeader('Content-Disposition',`attachment; filename="${String(x.file_name).replace(/"/g,'')}"`);res.setHeader('Content-Length',x.size_bytes);res.send(x.data)});
+
+app.use((err,req,res,next)=>{console.error(err);if(err.type==='entity.too.large')return res.status(413).json({error:'Request too large. Reduce image size.'});res.status(500).json({error:'Internal server error.'})});
+async function initDb(){ if(!pool) return; try{ const schema=await fs.readFile(new URL('../db/schema.sql',import.meta.url),'utf8'); await pool.query(schema); console.log('Database schema ready'); }catch(e){ console.error('Database schema init failed:',e?.message||e); } }
+initDb().finally(()=>app.listen(PORT,()=>console.log(`RextFlex backend listening on http://localhost:${PORT} | db=${Boolean(pool)} groq=${Boolean(groq)} e2b=${Boolean(process.env.E2B_API_KEY)}`)));

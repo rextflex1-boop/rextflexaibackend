@@ -1,30 +1,20 @@
-# RextFlex AI — Backend
+# RextFlex AI Backend
 
-Private server for the Expo mobile app. Keep all provider secrets here, never inside the APK.
+This Railway-ready backend keeps all provider and database secrets off the APK.
 
-## Railway
-Set the values from `.env.example` in Railway Variables, especially:
-- `GROQ_API_KEY`
-- `GROQ_MODEL_SILICON`
-- `GROQ_MODEL_TITAN`
-- `GROQ_MODEL_APEX`
+Features copied from the original RextFlex AI web project:
+- email/password auth + persistent bearer sessions
+- Google OAuth handoff endpoint (optional; configure credentials)
+- persistent chat sessions/messages
+- model tiers: Silicon / Titan / Apex
+- thinking toggle / reasoning effort
+- web search toggle via Groq Compound Mini
+- image chat input
+- per-user tone + personas + active persona
+- session rename/delete/new chat
+- E2B project builder that creates a ZIP and returns a chat-visible download URL
+- generated ZIP storage in Postgres
+- secure user-scoped file downloads
 
-Start command:
-```bash
-npm start
-```
-
-Health check:
-```text
-GET /health
-```
-
-Chat endpoint:
-```text
-POST /api/chat
-```
-
-The Expo app only needs:
-```env
-EXPO_PUBLIC_API_URL=https://YOUR-RAILWAY-DOMAIN
-```
+Run `db/schema.sql` against your Neon/Postgres database.
+Then set env vars on Railway and deploy.
