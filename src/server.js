@@ -73,10 +73,84 @@ async function getPrompt(userId){const r=await q(`select s.tone,p.instructions f
 app.post('/api/chat',auth,async(req,res)=>{try{if(!groq)return res.status(503).json({error:'GROQ_API_KEY is not configured.'});const {messages=[],sessionId,modelTier='titan',thinkingEnabled=true,webSearchEnabled=true}=req.body||{};if(!sessionId||!(await ensureSessionOwned(sessionId,req.user.id)))return res.status(404).json({error:'Chat session not found.'});const userMessage=messages[messages.length-1];if(userMessage?.role==='user'){await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'user',$3::jsonb) on conflict do nothing`,[userMessage.id||id('msg'),sessionId,JSON.stringify(userMessage)]);await q(`update chat_sessions set title=coalesce(title, $1),updated_at=now() where id=$2 and user_id=$3`,[String(userMessage.text||'New chat').trim().slice(0,80),sessionId,req.user.id]);}
   const extra=await getPrompt(req.user.id);const system=`You are RextFlex AI, a helpful high-quality general AI assistant. Be accurate, practical, concise but useful. ${extra||''}`.trim();const hasImage=messages.some(m=>Boolean(m?.imageUri));const model=(webSearchEnabled&&!hasImage)?WEB_MODEL:(hasImage?VISION_MODEL:modelFor(modelTier));const body={model,messages:buildGroqMessages(messages,system),max_completion_tokens:4096,temperature:0.4};if(webSearchEnabled&&!hasImage)body.compound_custom={tools:{enabled_tools:['web_search','visit_website']}};if(thinkingEnabled&&!webSearchEnabled)body.reasoning_effort=(modelTier==='silicon'?'low':modelTier==='apex'?'medium':'medium');const r=await groq.chat.completions.create(body);const text=r.choices?.[0]?.message?.content||'No response was returned.';const assistant={id:id('msg'),role:'assistant',text,createdAt:Date.now()};await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'assistant',$3::jsonb)`,[assistant.id,sessionId,JSON.stringify(assistant)]);await q(`update chat_sessions set updated_at=now() where id=$1`,[sessionId]);const citations=(r.choices?.[0]?.message?.executed_tools||[]).flatMap(x=>x.search_results||[]).map(x=>({title:x.title||x.url||'Source',url:x.url||''})).filter(x=>x.url).slice(0,10);res.json({message:assistant,sessionId,citations});}catch(e){console.error('chat',e);res.status(500).json({error:e?.message||'AI request failed.'})}});
 
-const FILE_SYSTEM=`You are an expert software engineer. Generate a complete small project from the user's request. Return ONLY valid JSON with shape {"reply":"string","files":[{"path":"relative/path","content":"text"}],"setupCommands":["optional shell command"]}. Keep files concise and omit dependencies' lockfiles/node_modules. The project must be directly usable. Prefer simple static HTML/CSS/JS when the user does not specify a framework.`;
-app.post('/api/build',auth,async(req,res)=>{try{if(!groq)return res.status(503).json({error:'GROQ_API_KEY is not configured.'});if(!process.env.E2B_API_KEY)return res.status(503).json({error:'E2B_API_KEY is not configured.'});const prompt=String(req.body?.prompt||'').trim();if(!prompt)return res.status(400).json({error:'Build prompt is required.'});const model=modelFor(req.body?.modelTier||'titan');const out=await groq.chat.completions.create({model,messages:[{role:'system',content:FILE_SYSTEM},{role:'user',content:prompt}],response_format:{type:'json_object'},max_completion_tokens:16000,temperature:0.2});let spec;try{spec=JSON.parse(out.choices?.[0]?.message?.content||'{}')}catch{throw new Error('AI returned invalid project JSON. Try a more specific build prompt.')}if(!Array.isArray(spec.files)||spec.files.length===0)throw new Error('AI did not return any project files.');const sandbox=await Sandbox.create({timeoutMs:10*60*1000});const root='/home/user/project';const logs=[];for(const f of spec.files.slice(0,40)){const p=`${root}/${String(f.path||'').replace(/^\/+|\.\.(\/|\\)/g,'')}`;await sandbox.files.write([{path:p,data:String(f.content??'')}]);logs.push(`Wrote ${f.path}`)}for(const cmd of (Array.isArray(spec.setupCommands)?spec.setupCommands:[]).slice(0,6)){const result=await sandbox.commands.run(`cd ${root} && ${cmd}`,{timeoutMs:90000});logs.push(`$ ${cmd}\n${result.stdout||result.stderr||''}`)}await sandbox.files.write([{path:'/home/user/_zip.py',data:`import os,zipfile\nsrc='${root}'\ndst='/home/user/project.zip'\nwith zipfile.ZipFile(dst,'w',zipfile.ZIP_DEFLATED) as z:\n  for r,ds,fs in os.walk(src):\n    ds[:]=[d for d in ds if d not in ('node_modules','.git')]\n    for fn in fs:\n      p=os.path.join(r,fn); z.write(p,os.path.relpath(p,src))\n`}]);const z=await sandbox.commands.run('python3 /home/user/_zip.py',{timeoutMs:90000});if(z.exitCode!==0)throw new Error('ZIP creation failed.');const info=await sandbox.files.getInfo('/home/user/project.zip');if(!info||info.size>MAX_ZIP_BYTES)throw new Error(`Project ZIP is too large (${((info?.size||0)/1024/1024).toFixed(1)}MB).`);const bytes=await sandbox.files.read('/home/user/project.zip',{format:'bytes'});const fileId=id('file');const fileName=(String(spec.zipName||'rextflex-project.zip').replace(/[^a-zA-Z0-9._-]/g,'-').slice(0,80)||'rextflex-project.zip');await q(`insert into generated_files(id,user_id,session_id,file_name,mime_type,size_bytes,data) values($1,$2,$3,$4,'application/zip',$5,$6)`,[fileId,req.user.id,req.body.sessionId||null,fileName,bytes.length,Buffer.from(bytes)]);if(req.body.sessionId){const msg={id:id('msg'),role:'assistant',text:String(spec.reply||`Built ${fileName}`),file:{id:fileId,name:fileName,url:`${process.env.PUBLIC_URL||''}/api/files/${fileId}?sig=${fileSig(fileId,req.user.id)}`,sizeBytes:bytes.length},createdAt:Date.now()};await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'assistant',$3::jsonb)`,[msg.id,req.body.sessionId,JSON.stringify(msg)])}await sandbox.kill();res.json({reply:String(spec.reply||`Built ${fileName} successfully.`),file:{id:fileId,name:fileName,url:`${process.env.PUBLIC_URL||''}/api/files/${fileId}?sig=${fileSig(fileId,req.user.id)}`,sizeBytes:bytes.length},log:logs.join('\n')});}catch(e){console.error('build',e);res.status(500).json({error:e?.message||'Build failed.'})}});
+const FILE_SYSTEM=`You are RextFlex AI Project Builder. Generate a complete, directly usable small project from the user's request. Return ONLY valid JSON with this exact shape: {"reply":"short summary","zipName":"project.zip","files":[{"path":"relative/path","content":"file contents"}]}. Never include node_modules, package-lock, secrets, binaries, or files larger than 180000 characters. Prefer static HTML/CSS/JS unless a framework is explicitly requested. Keep the project reasonably small (maximum 30 files).`;
+function parseProjectJson(raw){
+  const text=String(raw||'').trim();
+  try{return JSON.parse(text)}catch{}
+  const fenced=text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if(fenced) try{return JSON.parse(fenced[1])}catch{}
+  const first=text.indexOf('{'), last=text.lastIndexOf('}');
+  if(first>=0&&last>first) try{return JSON.parse(text.slice(first,last+1))}catch{}
+  throw new Error('AI returned invalid project JSON. Try a more specific build request.');
+}
+app.post('/api/build',auth,async(req,res)=>{
+  let sandbox=null;
+  try{
+    if(!groq)return res.status(503).json({error:'GROQ_API_KEY is not configured.'});
+    if(!process.env.E2B_API_KEY)return res.status(503).json({error:'E2B_API_KEY is not configured.'});
+    const prompt=String(req.body?.prompt||'').trim();
+    if(!prompt)return res.status(400).json({error:'Build prompt is required.'});
+    const model=process.env.GROQ_BUILD_MODEL||MODEL.titan;
+    const out=await groq.chat.completions.create({
+      model,
+      messages:[{role:'system',content:FILE_SYSTEM},{role:'user',content:prompt}],
+      response_format:{type:'json_object'},
+      max_completion_tokens:Number(process.env.GROQ_BUILD_MAX_TOKENS||14000),
+      temperature:0.15
+    });
+    const spec=parseProjectJson(out.choices?.[0]?.message?.content);
+    if(!Array.isArray(spec.files)||spec.files.length===0)throw new Error('AI did not return any project files.');
+    const files=spec.files.slice(0,30).filter(f=>f&&f.path&&typeof f.content==='string').map(f=>({
+      path:String(f.path).replace(/^\/+/,'').replace(/\.\.(\/|\\)/g,'').slice(0,220),
+      content:String(f.content).slice(0,180000)
+    })).filter(f=>f.path&&f.content.length>=0);
+    if(!files.length)throw new Error('No safe project files were returned.');
+    const root='/home/user/project';
+    const logs=[`AI generated ${files.length} files using ${model}`];
+    sandbox=await Sandbox.create({timeoutMs:10*60*1000});
+    for(const f of files){
+      const p=`${root}/${f.path}`;
+      await sandbox.files.write([{path:p,data:f.content}]);
+      logs.push(`✓ ${f.path} (${Buffer.byteLength(f.content,'utf8')} bytes)`);
+    }
+    // Do not run arbitrary AI-provided setup commands. The builder only packages
+    // the generated files, which makes ZIP creation deterministic and safer.
+    const zipScript=`import os,zipfile\nsrc='${root}'\ndst='/home/user/project.zip'\nwith zipfile.ZipFile(dst,'w',zipfile.ZIP_DEFLATED) as z:\n    for r,ds,fs in os.walk(src):\n        ds[:]=[d for d in ds if d not in ('node_modules','.git')]\n        for fn in fs:\n            p=os.path.join(r,fn)\n            z.write(p,os.path.relpath(p,src))\n`;
+    await sandbox.files.write([{path:'/home/user/_make_zip.py',data:zipScript}]);
+    const zr=await sandbox.commands.run('python3 /home/user/_make_zip.py',{timeoutMs:90000});
+    if(zr.exitCode!==0)throw new Error(`ZIP creation failed: ${zr.stderr||zr.stdout||'unknown E2B error'}`);
+    const info=await sandbox.files.getInfo('/home/user/project.zip');
+    const size=Number(info?.size||0);
+    if(!size)throw new Error('E2B created an empty ZIP.');
+    if(size>MAX_ZIP_BYTES)throw new Error(`Project ZIP is too large (${(size/1024/1024).toFixed(1)}MB). Limit is ${process.env.E2B_MAX_ZIP_MB||8}MB.`);
+    const bytes=await sandbox.files.read('/home/user/project.zip',{format:'bytes'});
+    if(!bytes||!bytes.length)throw new Error('Could not read the generated ZIP from E2B.');
+    const fileId=id('file');
+    const fileName=(String(spec.zipName||'rextflex-project.zip').replace(/[^a-zA-Z0-9._-]/g,'-').slice(0,80)||'rextflex-project.zip').toLowerCase().endsWith('.zip')?String(spec.zipName||'rextflex-project.zip').replace(/[^a-zA-Z0-9._-]/g,'-').slice(0,80):`${String(spec.zipName||'rextflex-project').replace(/[^a-zA-Z0-9._-]/g,'-').slice(0,75)}.zip`;
+    const publicUrl=`${process.env.PUBLIC_URL||''}/api/files/${fileId}?sig=${fileSig(fileId,req.user.id)}`;
+    await q(`insert into generated_files(id,user_id,session_id,file_name,mime_type,size_bytes,data) values($1,$2,$3,$4,'application/zip',$5,$6)`,
+      [fileId,req.user.id,req.body.sessionId||null,fileName,bytes.length,Buffer.from(bytes)]);
+    const file={id:fileId,name:fileName,url:publicUrl,sizeBytes:bytes.length};
+    if(req.body.sessionId){
+      const msg={id:id('msg'),role:'assistant',text:String(spec.reply||`Built ${fileName} with ${files.length} files.`),file,createdAt:Date.now()};
+      await q(`insert into chat_messages(id,session_id,role,message) values($1,$2,'assistant',$3::jsonb)`,[msg.id,req.body.sessionId,JSON.stringify(msg)]);
+    }
+    logs.push(`✓ ZIP ready: ${fileName} (${bytes.length} bytes)`);
+    await sandbox.kill(); sandbox=null;
+    return res.json({reply:String(spec.reply||`Built ${fileName} with ${files.length} files.`),file,files:files.map(f=>({path:f.path,sizeBytes:Buffer.byteLength(f.content,'utf8')})),log:logs.join('\n')});
+  }catch(e){
+    if(sandbox)await sandbox.kill().catch(()=>{});
+    console.error('build',e);
+    return res.status(500).json({error:e?.message||'Build failed.'});
+  }
+});
 
 app.get('/api/files/:id',async(req,res)=>{let userId=null;const raw=getBearer(req);if(raw){const r=await q(`select user_id from auth_sessions where token_hash=$1 and expires_at>now()`,[hash(raw)]);userId=r.rows[0]?.user_id||null;}if(!userId&&req.query.sig){const r=await q(`select user_id from generated_files where id=$1`,[req.params.id]);const uid=r.rows[0]?.user_id;if(uid&&safeEqualText(String(req.query.sig),fileSig(req.params.id,uid)))userId=uid;}if(!userId)return res.status(401).json({error:'Unauthorized file link.'});const r=await q(`select file_name,mime_type,size_bytes,data from generated_files where id=$1 and user_id=$2`,[req.params.id,userId]);const x=r.rows[0];if(!x)return res.status(404).json({error:'File not found.'});res.setHeader('Content-Type',x.mime_type);res.setHeader('Content-Disposition',`attachment; filename="${String(x.file_name).replace(/"/g,'')}"`);res.setHeader('Content-Length',x.size_bytes);res.send(x.data)});
+
+
+const DEVICE_PLAN_SYSTEM=`You are RextFlex AI Device Control Planner. Convert a user's phone-control request into a safe structured action plan. Return ONLY JSON: {"summary":"string","requiresConfirmation":true,"safetyNotes":["string"],"actions":[{"type":"open_app|home|back|recents|tap|swipe|click_text|set_text|wait","label":"string","x":0,"y":0,"x1":0,"y1":0,"x2":0,"y2":0,"text":"string","ms":400,"durationMs":500,"risk":"low|medium|high","stopOnFailure":true}]}. Use open_app only with app names such as Chrome, WhatsApp, YouTube, Instagram, Gmail, or Settings. Never automate purchases, financial transfers, password entry, account deletion, security-setting changes, or sending messages without explicit user confirmation. Prefer click_text over coordinate taps.
+`;
+app.post('/api/device/plan',auth,async(req,res)=>{try{if(!groq)return res.status(503).json({error:'GROQ_API_KEY is not configured.'});const prompt=String(req.body?.prompt||'').trim();if(!prompt)return res.status(400).json({error:'Task description is required.'});const out=await groq.chat.completions.create({model:process.env.GROQ_DEVICE_MODEL||MODEL.titan,messages:[{role:'system',content:DEVICE_PLAN_SYSTEM},{role:'user',content:prompt}],response_format:{type:'json_object'},max_completion_tokens:1200,temperature:0.1});const plan=JSON.parse(out.choices?.[0]?.message?.content||'{}');const allowed=new Set(['open_app','home','back','recents','tap','swipe','click_text','set_text','wait']);if(!Array.isArray(plan.actions))throw new Error('AI returned an invalid device plan.');plan.actions=plan.actions.slice(0,12).filter(a=>a&&allowed.has(a.type)).map(a=>({...a,risk:['low','medium','high'].includes(a.risk)?a.risk:'medium',stopOnFailure:a.stopOnFailure!==false}));plan.requiresConfirmation=true;plan.summary=String(plan.summary||'User-approved device task').slice(0,240);plan.safetyNotes=Array.isArray(plan.safetyNotes)?plan.safetyNotes.slice(0,6):['Review the task before running it.'];res.json({plan});}catch(e){console.error('device-plan',e);res.status(500).json({error:e?.message||'Could not create device plan.'})}});
 
 app.use((err,req,res,next)=>{console.error(err);if(err.type==='entity.too.large')return res.status(413).json({error:'Request too large. Reduce image size.'});res.status(500).json({error:'Internal server error.'})});
 async function initDb(){ if(!pool) return; try{ const schema=await fs.readFile(new URL('../db/schema.sql',import.meta.url),'utf8'); await pool.query(schema); console.log('Database schema ready'); }catch(e){ console.error('Database schema init failed:',e?.message||e); } }

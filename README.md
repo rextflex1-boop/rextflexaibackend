@@ -18,3 +18,7 @@ Features copied from the original RextFlex AI web project:
 
 Run `db/schema.sql` against your Neon/Postgres database.
 Then set env vars on Railway and deploy.
+
+
+## Reliable E2B ZIP generation
+`POST /api/build` now generates a bounded set of files, writes them to E2B, creates `/home/user/project.zip` deterministically, validates the ZIP size, stores it in `generated_files`, and returns a `files` manifest plus build log. Arbitrary AI setup commands are not executed.
