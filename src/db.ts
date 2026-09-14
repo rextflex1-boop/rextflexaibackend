@@ -1,18 +1,26 @@
-import { neon } from '@neondatabase/serverless';
+import { neon, Pool } from '@neondatabase/serverless';
 
 export const sql = process.env.DATABASE_URL ? neon(process.env.DATABASE_URL) : null;
 
 export async function migrate(){
-  if(!sql) throw new Error('DATABASE_URL is required');
-  await sql(`create extension if not exists pgcrypto`);
-  await sql(`create table if not exists app_users(id text primary key,name text not null,email text not null unique,password_hash text not null,created_at timestamptz not null default now())`);
-  await sql(`create table if not exists chat_sessions(id text primary key,user_id text not null references app_users(id) on delete cascade,title text,is_public boolean not null default false,created_at timestamptz not null default now(),updated_at timestamptz not null default now())`);
-  await sql(`create table if not exists chat_messages(id text primary key,session_id text not null references chat_sessions(id) on delete cascade,role text not null,message jsonb not null,created_at timestamptz not null default now())`);
-  await sql(`create table if not exists personas(id text primary key,user_id text not null references app_users(id) on delete cascade,name text not null,instructions text not null,created_at timestamptz not null default now())`);
-  await sql(`create table if not exists user_settings(user_id text primary key references app_users(id) on delete cascade,tone text,active_persona_id text references personas(id) on delete set null,model_tier text not null default 'titan',theme text not null default 'dark',updated_at timestamptz not null default now())`);
-  await sql(`create table if not exists generated_files(id text primary key,user_id text not null references app_users(id) on delete cascade,session_id text references chat_sessions(id) on delete cascade,file_name text not null,mime_type text not null,size_bytes integer not null,data bytea not null,created_at timestamptz not null default now())`);
-  await sql(`create table if not exists agent_tasks(id text primary key,user_id text not null references app_users(id) on delete cascade,session_id text,prompt text not null,mode text not null,status text not null,requires_confirmation boolean not null default false,plan jsonb not null default '[]',created_at timestamptz not null default now(),updated_at timestamptz not null default now())`);
-  await sql(`create table if not exists agent_events(id text primary key,task_id text not null references agent_tasks(id) on delete cascade,type text not null,message text not null,data jsonb,created_at timestamptz not null default now())`);
+  if(!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  try {
+    const statements = [
+      `create extension if not exists pgcrypto`,
+      `create table if not exists app_users(id text primary key,name text not null,email text not null unique,password_hash text not null,created_at timestamptz not null default now())`,
+      `create table if not exists chat_sessions(id text primary key,user_id text not null references app_users(id) on delete cascade,title text,is_public boolean not null default false,created_at timestamptz not null default now(),updated_at timestamptz not null default now())`,
+      `create table if not exists chat_messages(id text primary key,session_id text not null references chat_sessions(id) on delete cascade,role text not null,message jsonb not null,created_at timestamptz not null default now())`,
+      `create table if not exists personas(id text primary key,user_id text not null references app_users(id) on delete cascade,name text not null,instructions text not null,created_at timestamptz not null default now())`,
+      `create table if not exists user_settings(user_id text primary key references app_users(id) on delete cascade,tone text,active_persona_id text references personas(id) on delete set null,model_tier text not null default 'titan',theme text not null default 'dark',updated_at timestamptz not null default now())`,
+      `create table if not exists generated_files(id text primary key,user_id text not null references app_users(id) on delete cascade,session_id text references chat_sessions(id) on delete cascade,file_name text not null,mime_type text not null,size_bytes integer not null,data bytea not null,created_at timestamptz not null default now())`,
+      `create table if not exists agent_tasks(id text primary key,user_id text not null references app_users(id) on delete cascade,session_id text,prompt text not null,mode text not null,status text not null,requires_confirmation boolean not null default false,plan jsonb not null default '[]',created_at timestamptz not null default now(),updated_at timestamptz not null default now())`,
+      `create table if not exists agent_events(id text primary key,task_id text not null references agent_tasks(id) on delete cascade,type text not null,message text not null,data jsonb,created_at timestamptz not null default now())`
+    ];
+    for (const statement of statements) await pool.query(statement);
+  } finally {
+    await pool.end();
+  }
 }
 
 export async function userByEmail(email:string){ if(!sql)return null; const r=await sql`select * from app_users where lower(email)=lower(${email}) limit 1`; return r[0]||null; }
