@@ -7,12 +7,11 @@ export async function POST(req: Request) {
   if (!email || !password) return Response.json({ error: "Email and password are required" }, { status: 400 });
   try {
     const result = await auth.api.signInEmail({ body: { email, password } });
-    const session = result?.session;
     const user = result?.user;
-    if (!session || !user) return Response.json({ error: "Invalid credentials" }, { status: 401 });
+    const token = result?.token;
+    if (!token || !user) return Response.json({ error: "Invalid credentials" }, { status: 401 });
     return Response.json({
-      token: session.token,
-      expiresAt: session.expiresAt,
+      token,
       user: { id: user.id, name: user.name, email: user.email, image: user.image },
     });
   } catch (error) {
