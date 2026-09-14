@@ -1,21 +1,11 @@
-create table if not exists app_users (
+create table if not exists app_users(
   id text primary key,
   name text not null,
   email text not null unique,
   password_hash text not null,
-  image text,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-create table if not exists auth_sessions (
-  id text primary key,
-  user_id text not null references app_users(id) on delete cascade,
-  token_hash text not null unique,
-  expires_at timestamptz not null,
   created_at timestamptz not null default now()
 );
-create index if not exists auth_sessions_user_idx on auth_sessions(user_id);
-create table if not exists chat_sessions (
+create table if not exists chat_sessions(
   id text primary key,
   user_id text not null references app_users(id) on delete cascade,
   title text,
@@ -23,31 +13,29 @@ create table if not exists chat_sessions (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-create index if not exists chat_sessions_user_idx on chat_sessions(user_id);
-create table if not exists chat_messages (
+create table if not exists chat_messages(
   id text primary key,
   session_id text not null references chat_sessions(id) on delete cascade,
-  role text not null check (role in ('user','assistant')),
+  role text not null,
   message jsonb not null,
   created_at timestamptz not null default now()
 );
-create index if not exists chat_messages_session_idx on chat_messages(session_id);
-create table if not exists personas (
+create table if not exists personas(
   id text primary key,
   user_id text not null references app_users(id) on delete cascade,
   name text not null,
   instructions text not null,
   created_at timestamptz not null default now()
 );
-create index if not exists personas_user_idx on personas(user_id);
-create table if not exists user_settings (
+create table if not exists user_settings(
   user_id text primary key references app_users(id) on delete cascade,
-  tone text default '',
+  tone text,
   active_persona_id text references personas(id) on delete set null,
   model_tier text not null default 'titan',
+  theme text not null default 'dark',
   updated_at timestamptz not null default now()
 );
-create table if not exists generated_files (
+create table if not exists generated_files(
   id text primary key,
   user_id text not null references app_users(id) on delete cascade,
   session_id text references chat_sessions(id) on delete cascade,
@@ -57,4 +45,23 @@ create table if not exists generated_files (
   data bytea not null,
   created_at timestamptz not null default now()
 );
-create index if not exists generated_files_user_idx on generated_files(user_id);
+create table if not exists agent_tasks(
+  id text primary key,
+  user_id text not null references app_users(id) on delete cascade,
+  session_id text,
+  prompt text not null,
+  mode text not null,
+  status text not null,
+  requires_confirmation boolean not null default false,
+  plan jsonb not null default '[]',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create table if not exists agent_events(
+  id text primary key,
+  task_id text not null references agent_tasks(id) on delete cascade,
+  type text not null,
+  message text not null,
+  data jsonb,
+  created_at timestamptz not null default now()
+);

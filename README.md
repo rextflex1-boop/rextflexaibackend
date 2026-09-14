@@ -1,24 +1,52 @@
-# RextFlex AI Backend
+# RextFlex AI Backend — Railway
 
-This Railway-ready backend keeps all provider and database secrets off the APK.
+This backend ports the behavior of the original RextFlex AI web app into a standalone API for Expo Android.
 
-Features copied from the original RextFlex AI web project:
-- email/password auth + persistent bearer sessions
-- Google OAuth handoff endpoint (optional; configure credentials)
-- persistent chat sessions/messages
-- model tiers: Silicon / Titan / Apex
-- thinking toggle / reasoning effort
-- web search toggle via Groq Compound Mini
-- image chat input
-- per-user tone + personas + active persona
-- session rename/delete/new chat
-- E2B project builder that creates a ZIP and returns a chat-visible download URL
-- generated ZIP storage in Postgres
-- secure user-scoped file downloads
+## Railway services
+Recommended:
+1. Node service from this folder
+2. PostgreSQL service
 
-Run `db/schema.sql` against your Neon/Postgres database.
-Then set env vars on Railway and deploy.
+Railway will provide DATABASE_URL to the Node service if you link the Postgres service.
 
+## Required environment variables
+- DATABASE_URL
+- JWT_SECRET
+- GROQ_API_KEY
+- E2B_API_KEY for project/ZIP generation
 
-## Reliable E2B ZIP generation
-`POST /api/build` now generates a bounded set of files, writes them to E2B, creates `/home/user/project.zip` deterministically, validates the ZIP size, stores it in `generated_files`, and returns a `files` manifest plus build log. Arbitrary AI setup commands are not executed.
+Recommended:
+- TAVILY_API_KEY for reliable web search
+- ALLOWED_ORIGINS set to your Expo/web origins as needed
+
+## Groq model mapping
+Silicon -> openai/gpt-oss-20b
+Titan -> openai/gpt-oss-120b (default)
+Apex -> qwen/qwen3.8-27b
+
+The server does not expose provider model IDs to the Android client.
+
+## E2B ZIP generation
+The implementation mirrors the original:
+- shared per-request sandbox
+- writeFile one file per call
+- max 6 setup commands
+- 90s command timeout
+- 10min sandbox lifetime
+- excludes node_modules and .git
+- 8 MiB default archive limit
+- generated ZIP stored in Postgres bytea
+- protected download route
+
+## Web search
+Tavily first, DuckDuckGo HTML fallback if TAVILY_API_KEY is not set.
+
+## Run
+npm install
+npm run dev
+
+Health:
+GET /health
+
+## Production
+Deploy this folder as a Railway service and set the same environment variables from `.env.example`.
