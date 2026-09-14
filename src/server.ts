@@ -10,9 +10,15 @@ import {createTask,getTask,approve,cancel} from './agent.js';
 import {finishBuild,writeFile} from './sandbox.js';
 import {webSearch} from './search.js';
 
-const app=express();app.use(cors({origin:process.env.ALLOWED_ORIGINS==='*'||!process.env.ALLOWED_ORIGINS?true:process.env.ALLOWED_ORIGINS.split(',')}));app.use(express.json({limit:'12mb'}));
+const app=express();
+app.use(cors({origin:process.env.ALLOWED_ORIGINS==='*'||!process.env.ALLOWED_ORIGINS?true:process.env.ALLOWED_ORIGINS.split(',')}));app.use(express.json({limit:'12mb'}));
 
-const auth=async(req:any,res:any,next:any)=>{const u=await verify(req);if(!u)return res.status(401).json({error:'Unauthorized'});req.user=u;next();};
+const auth: express.RequestHandler = async (req, res, next) => {
+  const u = await verify(req);
+  if (!u) { res.status(401).json({ error: 'Unauthorized' }); return; }
+  req.user = u;
+  next();
+};
 app.get('/health',(_req,res)=>res.json({ok:true,service:'rextflexai-backend',models:Object.keys(MODEL_TIERS)}));
 
 app.post('/v1/auth/signup',async(req,res)=>{try{const {name,email,password}=req.body;res.json(await signup(name,email,password));}catch(e:any){res.status(400).json({error:e.message})}});
